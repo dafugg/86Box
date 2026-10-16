@@ -111,6 +111,9 @@ char_file_write(uint8_t *buf, size_t len, void *priv)
         buf += write_count;
         len -= write_count;
     }
+    /* Flush so the file can be followed live (e.g. tail -f, test harnesses);
+       serial data rates make the cost negligible. */
+    fflush(dev->file_out);
     return ret;
 }
 

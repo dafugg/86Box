@@ -36,6 +36,8 @@ startup), `frames` (frames rendered) and `held`.
 | `key down\|up <scancode>...` | Press or release keys. Scancodes are set-1 make codes; add `0x100` for E0-prefixed keys (e.g. `0x148` = Up). Events are delivered 2 ms of emulated time apart (a burst would overflow the keyboard FIFO); the reply comes after the last event plus its 2 ms, so a request consumes 2 ms per key. |
 | `mouse <dx> <dy> <buttons>` | Relative motion; buttons bitmask 1=left, 2=right, 4=middle. |
 | `screenshot <path>` | Write the most recent frame of monitor 0 as a PNG file. Reply has `w`, `h`. |
+| `record start <interval_ms> <dir>` / `record stop` | Save the displayed frame as `<dir>/<emulated ms>.png` every `interval_ms` of emulated time, whatever advances the clock (steps, waits, real time). The directory must exist. `stop` replies with the number of frames written. |
+| `info` | Version, machine, CPU and clock, RAM, video and sound cards, mounted hard disk/floppy/CD images, `hard_resets`/`soft_resets` (every CPU reset, including a guest triple fault) and `last_reset_ms`, and `speed_percent` (100 = real time). |
 | `text` | Text-mode screen via the BIOS data area: `mode`, `cols`, `rows`, `cursor` [row, col], and `chars`/`attrs` as one hex string per row (CP437). Fails in graphics modes. |
 | `memr <addr> <len>` | Read up to 65536 bytes of physical memory; `data` is hex. |
 | `memw <addr> <hex>` | Write bytes to physical memory. |

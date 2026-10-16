@@ -41,6 +41,9 @@
 #include <86box/timer.h>
 #include <86box/fdd.h>
 #include <86box/cdrom.h>
+#include <86box/hdd.h>
+#include <86box/machine.h>
+#include <86box/sound.h>
 #include <86box/keyboard.h>
 #include <86box/mem.h>
 #include <86box/mouse.h>
@@ -58,7 +61,7 @@
 /* Emulated ms between injected key events. One event can be up to six bytes
    in scan code set 2 (fake shifts around extended keys); delivering many at
    the same instant overflows the keyboard's 16-byte FIFO and loses keys. */
-#define KEY_GAP_MS          2
+#define KEY_GAP_MS 2
 
 #ifdef ENABLE_AUTOMATION_LOG
 int automation_do_log = ENABLE_AUTOMATION_LOG;
@@ -108,14 +111,14 @@ static strbuf_t   resp;
 
 /* CPU thread state. */
 static int      held;
-static int      cmd;              /* long-running command in progress */
-static int      cmd_was_held;     /* hold again once the command finishes */
-static uint64_t cmd_deadline;     /* emulated ms at which step/wait ends */
+static int      cmd;          /* long-running command in progress */
+static int      cmd_was_held; /* hold again once the command finishes */
+static uint64_t cmd_deadline; /* emulated ms at which step/wait ends */
 static char     wait_text[REQ_MAX];
 static uint32_t wait_addr;
 static uint8_t  wait_bytes[256];
 static int      wait_len;
-static uint64_t emu_ms;           /* emulated ms executed since startup */
+static uint64_t emu_ms; /* emulated ms executed since startup */
 
 static struct {
     uint16_t scan;
@@ -123,7 +126,17 @@ static struct {
 } key_queue[KEY_QUEUE_MAX];
 static int      key_head;
 static int      key_count;
-static uint64_t key_next_ms;      /* emulated ms at which the next key event is due */
+static uint64_t key_next_ms; /* emulated ms at which the next key event is due */
+
+/* Resets seen by the CPU, including ones the guest triggers itself. */
+static uint32_t hard_resets;
+static uint32_t soft_resets;
+static uint64_t last_reset_ms;
+
+/* Emulation speed, sampled over each second of emulated time. */
+static uint32_t speed_wall_start;
+static uint64_t speed_emu_start;
+static int      speed_percent = -1;
 
 /* Most recent frame handed to the renderer for monitor 0. */
 static mutex_t  *frame_mutex;
@@ -132,6 +145,12 @@ static int       frame_w;
 static int       frame_h;
 static int       frame_alloc;
 static uint64_t  frame_count;
+
+/* Recording: the displayed frame every rec_interval ms of emulated time. */
+static char     rec_dir[1024];
+static uint32_t rec_interval;
+static uint64_t rec_next_ms;
+static uint32_t rec_frames;
 
 static void
 sb_printf(strbuf_t *sb, const char *fmt, ...)
@@ -302,7 +321,93 @@ cmd_text(void)
     sb_printf(&resp, "]}");
 }
 
+/* ---- Machine information ---- */
+
+static void
+cmd_info(void)
+{
+    int first;
+
+    resp.len = 0;
+    sb_printf(&resp, "{\"ok\":true,\"protocol\":%d,\"version\":", AUTOMATION_PROTOCOL);
+    sb_json_string(&resp, EMU_VERSION_FULL);
+    sb_printf(&resp, ",\"machine\":");
+    sb_json_string(&resp, machine_get_internal_name());
+    sb_printf(&resp, ",\"machine_name\":");
+    sb_json_string(&resp, machine_getname(machine));
+    sb_printf(&resp, ",\"cpu_family\":");
+    sb_json_string(&resp, cpu_f->name);
+    sb_printf(&resp, ",\"cpu\":");
+    sb_json_string(&resp, cpu_s->name);
+    sb_printf(&resp, ",\"cpu_hz\":%u,\"mem_kb\":%u,\"video\":", cpu_s->rspeed, mem_size);
+    sb_json_string(&resp, video_get_internal_name(gfxcard[0]));
+    sb_printf(&resp, ",\"sound\":");
+    sb_json_string(&resp, sound_card_get_internal_name(sound_card_current[0]));
+
+    sb_printf(&resp, ",\"hdd\":[");
+    first = 1;
+    for (int i = 0; i < HDD_NUM; i++) {
+        if (hdd[i].bus_type == HDD_BUS_DISABLED)
+            continue;
+        sb_printf(&resp, "%s{\"index\":%d,\"file\":", first ? "" : ",", i);
+        sb_json_string(&resp, hdd[i].fn);
+        sb_printf(&resp, ",\"cylinders\":%u,\"heads\":%u,\"sectors\":%u}", hdd[i].tracks, hdd[i].hpc, hdd[i].spt);
+        first = 0;
+    }
+    sb_printf(&resp, "],\"floppy\":[");
+    first = 1;
+    for (int i = 0; i < FDD_NUM; i++) {
+        if (!drives[i].image_path[0])
+            continue;
+        sb_printf(&resp, "%s{\"drive\":%d,\"file\":", first ? "" : ",", i);
+        sb_json_string(&resp, drives[i].image_path);
+        sb_printf(&resp, "}");
+        first = 0;
+    }
+    sb_printf(&resp, "],\"cdrom\":[");
+    first = 1;
+    for (int i = 0; i < CDROM_NUM; i++) {
+        if ((cdrom[i].bus_type == CDROM_BUS_DISABLED) || !cdrom[i].image_path[0])
+            continue;
+        sb_printf(&resp, "%s{\"drive\":%d,\"file\":", first ? "" : ",", i);
+        sb_json_string(&resp, cdrom[i].image_path);
+        sb_printf(&resp, "}");
+        first = 0;
+    }
+    sb_printf(&resp, "],\"hard_resets\":%u,\"soft_resets\":%u,\"last_reset_ms\":%llu,\"speed_percent\":%d,"
+                     "\"ms\":%llu,\"frames\":%llu,\"held\":%s,\"paused\":%s,\"w\":%d,\"h\":%d}",
+              hard_resets, soft_resets, (unsigned long long) last_reset_ms, speed_percent,
+              (unsigned long long) emu_ms, (unsigned long long) frame_count, held ? "true" : "false",
+              dopause ? "true" : "false", frame_w, frame_h);
+}
+
+void
+automation_reset(int hard)
+{
+    if (hard)
+        hard_resets++;
+    else
+        soft_resets++;
+    last_reset_ms = emu_ms;
+}
+
 /* ---- Screenshots ---- */
+
+static int write_png(const char *fn);
+
+/* Called with frame_mutex held, right after a new frame was captured. */
+static void
+record_frame(void)
+{
+    char fn[1100];
+
+    if (!rec_interval || (emu_ms < rec_next_ms))
+        return;
+    snprintf(fn, sizeof(fn), "%s/%010llu.png", rec_dir, (unsigned long long) emu_ms);
+    if (write_png(fn))
+        rec_frames++;
+    rec_next_ms = emu_ms + rec_interval;
+}
 
 static int
 write_png(const char *fn)
@@ -374,6 +479,7 @@ automation_frame(int x, int y, int w, int h, int monitor_index)
     frame_w = w;
     frame_h = h;
     frame_count++;
+    record_frame();
     thread_release_mutex(frame_mutex);
 }
 
@@ -400,8 +506,8 @@ begin_timed(int which, uint64_t ms)
 static void
 end_timed(int matched)
 {
-    cmd  = CMD_NONE;
-    held = cmd_was_held;
+    cmd      = CMD_NONE;
+    held     = cmd_was_held;
     resp.len = 0;
     sb_printf(&resp, "{\"ok\":true,\"ms\":%llu,\"frames\":%llu,\"held\":%s",
               (unsigned long long) emu_ms, (unsigned long long) frame_count, held ? "true" : "false");
@@ -526,17 +632,17 @@ handle_request(char *line)
         }
     } else if (!strcmp(argv[0], "mouse") && (argc == 4)) {
         /* mouse <dx> <dy> <buttons> */
-        /* Mouse devices discard input unless the host has captured the mouse.
-           Set the flag directly: plat_mouse_capture() would grab the host
-           pointer, and is not safe to call from the CPU thread. */
-        mouse_capture = 1;
+        /* Mouse devices discard input unless the host UI has captured the
+           pointer; mouse_automation lets ours through without touching the
+           UI's capture state, so a visible window keeps working normally. */
+        mouse_automation = 1;
         mouse_scale(atoi(argv[1]), atoi(argv[2]));
         mouse_set_buttons_ex(atoi(argv[3]));
         respond_ok_time();
     } else if (!strcmp(argv[0], "screenshot") && (argc >= 2)) {
         int ok;
         thread_wait_mutex(frame_mutex);
-        ok = write_png(rest[1]);
+        ok       = write_png(rest[1]);
         resp.len = 0;
         if (ok)
             sb_printf(&resp, "{\"ok\":true,\"w\":%d,\"h\":%d,\"ms\":%llu,\"frames\":%llu}",
@@ -544,6 +650,26 @@ handle_request(char *line)
         thread_release_mutex(frame_mutex);
         if (!ok)
             respond_error(frame_buf ? "could not write file" : "no frame rendered yet");
+    } else if (!strcmp(argv[0], "record") && (argc >= 2)) {
+        /* record start <interval_ms> <dir> | record stop */
+        if (!strcmp(argv[1], "stop")) {
+            thread_wait_mutex(frame_mutex);
+            rec_interval = 0;
+            resp.len     = 0;
+            sb_printf(&resp, "{\"ok\":true,\"frames\":%u}", rec_frames);
+            thread_release_mutex(frame_mutex);
+        } else if (!strcmp(argv[1], "start") && (argc >= 4) && (atoi(argv[2]) > 0)) {
+            thread_wait_mutex(frame_mutex);
+            snprintf(rec_dir, sizeof(rec_dir), "%s", rest[3]);
+            rec_interval = atoi(argv[2]);
+            rec_next_ms  = emu_ms;
+            rec_frames   = 0;
+            thread_release_mutex(frame_mutex);
+            respond_ok_time();
+        } else
+            respond_error("usage: record start <interval_ms> <dir> | record stop");
+    } else if (!strcmp(argv[0], "info")) {
+        cmd_info();
     } else if (!strcmp(argv[0], "text")) {
         cmd_text();
     } else if (!strcmp(argv[0], "memr") && (argc == 3)) {
@@ -576,7 +702,7 @@ handle_request(char *line)
         free(buf);
     } else if (!strcmp(argv[0], "regs")) {
         static const char *names[8] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
-        resp.len = 0;
+        resp.len                    = 0;
         sb_printf(&resp, "{\"ok\":true");
         for (int i = 0; i < 8; i++)
             sb_printf(&resp, ",\"%s\":%u", names[i], cpu_state.regs[i].l);
@@ -670,6 +796,17 @@ automation_quantum(void)
 
     emu_ms += force_10ms ? 10 : 1;
 
+    /* Speed while running, held steps included: emulated vs host time per
+       emulated second. Wall time spent held between requests is excluded. */
+    if (!speed_wall_start || (emu_ms - speed_emu_start) > 1000) {
+        speed_wall_start = plat_get_ticks();
+        speed_emu_start  = emu_ms;
+    } else if ((emu_ms - speed_emu_start) == 1000) {
+        uint32_t wall    = plat_get_ticks() - speed_wall_start;
+        speed_percent    = wall ? (int) (100000 / wall) : -1;
+        speed_wall_start = 0;
+    }
+
     if (cmd == CMD_NONE)
         return;
 
@@ -740,7 +877,7 @@ automation_thread(UNUSED(void *priv))
 
             while ((nl = memchr(inbuf, '\n', inlen))) {
                 size_t linelen = nl - inbuf;
-                *nl = '\0';
+                *nl            = '\0';
                 if (linelen && (inbuf[linelen - 1] == '\r'))
                     inbuf[linelen - 1] = '\0';
 

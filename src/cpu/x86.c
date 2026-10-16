@@ -22,6 +22,7 @@
 #include <wchar.h>
 
 #define HAVE_STDARG_H
+#include <86box/automation.h>
 #include <86box/86box.h>
 #include "cpu.h"
 #include "x86.h"
@@ -237,6 +238,7 @@ makeznptable(void)
 static void
 reset_common(int hard)
 {
+    automation_reset(hard);
 #ifdef ENABLE_X86_LOG
     if (hard)
         x86_log("x86 reset\n");

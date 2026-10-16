@@ -244,8 +244,7 @@ main_thread(UNUSED(void *param))
                 nvr_dosave = 0;
                 frames     = 0;
             }
-        }
-        else /* Just so we dont overload the host OS. */
+        } else /* Just so we dont overload the host OS. */
             SDL_Delay(1);
 
         /* If needed, handle a screen resize. */

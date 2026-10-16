@@ -42,6 +42,8 @@ extern int  automation_run_state(void);
 extern void automation_quantum(void);
 /* Called by the video core whenever a frame is handed to the renderer. */
 extern void automation_frame(int x, int y, int w, int h, int monitor_index);
+/* Called by the CPU core on every reset (hard = 1 for power-on/hard reset). */
+extern void automation_reset(int hard);
 #else
 #    define automation_init()
 #    define automation_close()
@@ -49,6 +51,7 @@ extern void automation_frame(int x, int y, int w, int h, int monitor_index);
 #    define automation_run_state() AUTOMATION_FREE
 #    define automation_quantum()
 #    define automation_frame(x, y, w, h, monitor_index)
+#    define automation_reset(hard)
 #endif
 
 #ifdef __cplusplus
