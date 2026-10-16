@@ -20,6 +20,9 @@
  *
  *          Copyright 2026 86box-mcp contributors.
  */
+#ifdef _WIN32
+#    define _CRT_RAND_S /* rand_s(): the OS cryptographic RNG */
+#endif
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -28,11 +31,26 @@
 #include <string.h>
 #include <wchar.h>
 #include <png.h>
-#ifndef _WIN32
-#    include <errno.h>
+#include <errno.h>
+#ifdef _WIN32
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
+typedef SOCKET sock_t;
+#    define SOCK_INVALID INVALID_SOCKET
+#    define sock_close   closesocket
+#    define SOCK_SHUT_RW SD_BOTH
+#else
+#    include <fcntl.h>
+#    include <netdb.h>
+#    include <netinet/in.h>
 #    include <sys/socket.h>
+#    include <sys/stat.h>
 #    include <sys/un.h>
 #    include <unistd.h>
+typedef int sock_t;
+#    define SOCK_INVALID (-1)
+#    define sock_close   close
+#    define SOCK_SHUT_RW SHUT_RDWR
 #endif
 #define HAVE_STDARG_H
 #include <86box/86box.h>
@@ -95,14 +113,24 @@ typedef struct {
     size_t size;
 } strbuf_t;
 
-char automation_path[1024] = "";
-int  automation_start_held = 0;
+char automation_path[1024]       = "";
+char automation_token_file[1024] = "";
+int  automation_start_held       = 0;
+int  automation_allow_remote     = 0;
 
 static int       enabled;
 static thread_t *listen_thread;
-static int       listen_fd = -1;
-static int       client_fd = -1;
+static sock_t    listen_fd = SOCK_INVALID;
+static sock_t    client_fd = SOCK_INVALID;
 static event_t  *req_done;
+
+/* Transport: a UNIX domain socket (owner-only file permissions) or TCP,
+   which any local process can reach, so TCP clients must present a token. */
+static int  use_tcp;
+static char unix_path[1024];
+static char tcp_host[256];
+static char tcp_port[16];
+static char token[65]; /* 32 random bytes, hex */
 
 /* Mailbox between the listener thread and the CPU thread. */
 static char       req_line[REQ_MAX];
@@ -831,15 +859,16 @@ automation_quantum(void)
 
 /* ---- Listener thread ---- */
 
-#ifndef _WIN32
 static int
-write_all(int fd, const char *buf, size_t len)
+write_all(sock_t fd, const char *buf, size_t len)
 {
     while (len) {
-        ssize_t n = write(fd, buf, len);
+        int n = send(fd, buf, (int) len, 0);
         if (n < 0) {
+#ifndef _WIN32
             if (errno == EINTR)
                 continue;
+#endif
             return 0;
         }
         buf += n;
@@ -848,28 +877,46 @@ write_all(int fd, const char *buf, size_t len)
     return 1;
 }
 
+/* Compare without an early exit, so timing reveals nothing about the token. */
+static int
+token_matches(const char *given)
+{
+    size_t        len  = strlen(token);
+    unsigned char diff = (strlen(given) != len);
+
+    for (size_t i = 0; i < len; i++)
+        diff |= (unsigned char) (given[i] ^ token[i]) | (unsigned char) !given[i];
+    return !diff;
+}
+
 static void
 automation_thread(UNUSED(void *priv))
 {
     static char inbuf[REQ_MAX];
     size_t      inlen;
+    int         authed;
 
     while (enabled) {
         client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) {
+        if (client_fd == SOCK_INVALID) {
+#ifndef _WIN32
             if (errno == EINTR)
                 continue;
+#endif
             break;
         }
         automation_log("Automation: client connected\n");
-        inlen = 0;
+        inlen  = 0;
+        authed = !use_tcp;
 
         while (enabled) {
-            char   *nl;
-            ssize_t n = read(client_fd, inbuf + inlen, sizeof(inbuf) - 1 - inlen);
+            char *nl;
+            int   n = recv(client_fd, inbuf + inlen, (int) (sizeof(inbuf) - 1 - inlen), 0);
             if (n <= 0) {
+#ifndef _WIN32
                 if ((n < 0) && (errno == EINTR))
                     continue;
+#endif
                 break;
             }
             inlen += n;
@@ -881,14 +928,29 @@ automation_thread(UNUSED(void *priv))
                 if (linelen && (inbuf[linelen - 1] == '\r'))
                     inbuf[linelen - 1] = '\0';
 
-                strncpy(req_line, inbuf, sizeof(req_line) - 1);
-                req_line[sizeof(req_line) - 1] = '\0';
-                thread_reset_event(req_done);
-                atomic_store(&req_pending, 1);
-                thread_wait_event(req_done, -1);
+                if (!authed) {
+                    /* TCP: the first line must be "auth <token>"; anything else ends the connection. */
+                    if (!strncmp(inbuf, "auth ", 5) && token_matches(inbuf + 5)) {
+                        authed                 = 1;
+                        static const char ok[] = "{\"ok\":true,\"auth\":true}\n";
+                        if (!write_all(client_fd, ok, strlen(ok)))
+                            goto disconnect;
+                    } else {
+                        pclog("Automation: rejected a TCP client without a valid token\n");
+                        static const char no[] = "{\"ok\":false,\"error\":\"authentication required\"}\n";
+                        write_all(client_fd, no, strlen(no));
+                        goto disconnect;
+                    }
+                } else {
+                    strncpy(req_line, inbuf, sizeof(req_line) - 1);
+                    req_line[sizeof(req_line) - 1] = '\0';
+                    thread_reset_event(req_done);
+                    atomic_store(&req_pending, 1);
+                    thread_wait_event(req_done, -1);
 
-                if (!write_all(client_fd, resp.buf, resp.len) || !write_all(client_fd, "\n", 1))
-                    goto disconnect;
+                    if (!write_all(client_fd, resp.buf, resp.len) || !write_all(client_fd, "\n", 1))
+                        goto disconnect;
+                }
 
                 inlen -= linelen + 1;
                 memmove(inbuf, nl + 1, inlen);
@@ -901,46 +963,229 @@ automation_thread(UNUSED(void *priv))
         }
 disconnect:
         automation_log("Automation: client disconnected\n");
-        close(client_fd);
-        client_fd = -1;
+        sock_close(client_fd);
+        client_fd = SOCK_INVALID;
     }
+}
+
+/* "unix:<path>", "tcp:[host:]port", or a bare value: a UNIX socket path, or
+   a TCP port on Windows, which has no UNIX sockets here. */
+static int
+parse_endpoint(const char *spec)
+{
+    const char *rest = spec;
+    const char *colon;
+
+#ifdef _WIN32
+    use_tcp = 1;
+#else
+    use_tcp = 0;
+#endif
+    if (!strncmp(spec, "unix:", 5)) {
+        use_tcp = 0;
+        rest    = spec + 5;
+    } else if (!strncmp(spec, "tcp:", 4)) {
+        use_tcp = 1;
+        rest    = spec + 4;
+    }
+
+    if (!use_tcp) {
+#ifdef _WIN32
+        pclog("Automation: UNIX sockets are not supported on Windows; use tcp:[host:]port\n");
+        return 0;
+#else
+        snprintf(unix_path, sizeof(unix_path), "%s", rest);
+        return unix_path[0] != '\0';
+#endif
+    }
+
+    colon                = strrchr(rest, ':');
+    const char *port     = colon ? colon + 1 : rest;
+    size_t      host_len = colon ? (size_t) (colon - rest) : 0;
+
+    if ((strlen(port) >= sizeof(tcp_port)) || (host_len >= sizeof(tcp_host)))
+        return 0;
+    strcpy(tcp_port, port);
+    if (colon) {
+        memcpy(tcp_host, rest, host_len);
+        tcp_host[host_len] = '\0';
+    } else
+        strcpy(tcp_host, "127.0.0.1");
+    return tcp_host[0] && atoi(tcp_port) > 0;
+}
+
+static int
+is_loopback(const struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET)
+        return (ntohl(((const struct sockaddr_in *) sa)->sin_addr.s_addr) >> 24) == 127;
+    if (sa->sa_family == AF_INET6) {
+        static const unsigned char lo[16] = { [15] = 1 };
+        return !memcmp(&((const struct sockaddr_in6 *) sa)->sin6_addr, lo, 16);
+    }
+    return 0;
+}
+
+static int
+make_token(void)
+{
+    unsigned char bytes[32];
+
+#ifdef _WIN32
+    for (int i = 0; i < 32; i += 4) {
+        unsigned int v;
+        if (rand_s(&v))
+            return 0;
+        memcpy(bytes + i, &v, 4);
+    }
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f)
+        return 0;
+    size_t got = fread(bytes, 1, sizeof(bytes), f);
+    fclose(f);
+    if (got != sizeof(bytes))
+        return 0;
+#endif
+    for (int i = 0; i < 32; i++)
+        sprintf(token + (i * 2), "%02x", bytes[i]);
+    return 1;
+}
+
+/* Owner-only on POSIX; on Windows the file inherits the folder's permissions. */
+static int
+write_token_file(void)
+{
+    FILE *f;
+
+    if (!automation_token_file[0]) {
+        static const char name[] = "automation.token";
+        if ((strlen(usr_path) + sizeof(name)) > sizeof(automation_token_file))
+            return 0;
+        strcpy(automation_token_file, usr_path);
+        strcat(automation_token_file, name);
+    }
+#ifdef _WIN32
+    f = plat_fopen(automation_token_file, "wb");
+#else
+    int fd = open(automation_token_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return 0;
+    fchmod(fd, 0600);
+    f = fdopen(fd, "wb");
+#endif
+    if (!f)
+        return 0;
+    fprintf(f, "%s\n", token);
+    fclose(f);
+    return 1;
+}
+
+static int
+listen_tcp(void)
+{
+    struct addrinfo  hints;
+    struct addrinfo *res = NULL;
+    int              one = 1;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+    if (getaddrinfo(tcp_host, tcp_port, &hints, &res) || !res) {
+        pclog("Automation: cannot resolve %s\n", tcp_host);
+        return 0;
+    }
+    if (!is_loopback(res->ai_addr) && !automation_allow_remote) {
+        pclog("Automation: refusing to listen on non-loopback address %s; "
+              "pass --automation-allow-remote if you really want that\n",
+              tcp_host);
+        freeaddrinfo(res);
+        return 0;
+    }
+    if (!is_loopback(res->ai_addr))
+        pclog("Automation: WARNING: listening on %s; anyone who can reach it and has the token "
+              "fully controls this machine, including its memory\n",
+              tcp_host);
+
+    listen_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (listen_fd == SOCK_INVALID) {
+        freeaddrinfo(res);
+        return 0;
+    }
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof(one));
+    if (bind(listen_fd, res->ai_addr, (int) res->ai_addrlen) || listen(listen_fd, 1)) {
+        pclog("Automation: cannot listen on %s:%s\n", tcp_host, tcp_port);
+        sock_close(listen_fd);
+        listen_fd = SOCK_INVALID;
+        freeaddrinfo(res);
+        return 0;
+    }
+    freeaddrinfo(res);
+
+    if (!make_token() || !write_token_file()) {
+        pclog("Automation: cannot create the token file %s\n", automation_token_file);
+        sock_close(listen_fd);
+        listen_fd = SOCK_INVALID;
+        return 0;
+    }
+    return 1;
+}
+
+#ifndef _WIN32
+static int
+listen_unix(void)
+{
+    struct sockaddr_un addr;
+
+    if (strlen(unix_path) >= sizeof(addr.sun_path)) {
+        pclog("Automation: socket path too long: %s\n", unix_path);
+        return 0;
+    }
+    listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_fd < 0)
+        return 0;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, unix_path);
+    unlink(unix_path);
+
+    if ((bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) || (listen(listen_fd, 1) < 0)) {
+        pclog("Automation: cannot listen on %s: %s\n", unix_path, strerror(errno));
+        close(listen_fd);
+        listen_fd = -1;
+        return 0;
+    }
+    /* Only this user may connect. */
+    chmod(unix_path, 0600);
+    return 1;
 }
 #endif
 
 void
 automation_init(void)
 {
-#ifdef _WIN32
-    if (automation_path[0])
-        pclog("Automation: not supported on this platform yet\n");
-#else
-    struct sockaddr_un addr;
-
     if (!automation_path[0] || enabled)
         return;
 
-    if (strlen(automation_path) >= sizeof(addr.sun_path)) {
-        pclog("Automation: socket path too long: %s\n", automation_path);
+    if (!parse_endpoint(automation_path)) {
+        pclog("Automation: bad endpoint \"%s\"; use unix:<path> or tcp:[host:]port\n", automation_path);
         return;
     }
 
-    listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        pclog("Automation: socket() failed: %s\n", strerror(errno));
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa)) {
+        pclog("Automation: WSAStartup failed\n");
         return;
     }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, automation_path);
-    unlink(automation_path);
-
-    if ((bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) || (listen(listen_fd, 1) < 0)) {
-        pclog("Automation: cannot listen on %s: %s\n", automation_path, strerror(errno));
-        close(listen_fd);
-        listen_fd = -1;
+    if (!listen_tcp())
         return;
-    }
+#else
+    if (use_tcp ? !listen_tcp() : !listen_unix())
+        return;
+#endif
 
     resp.size   = 4096;
     resp.buf    = malloc(resp.size);
@@ -951,25 +1196,31 @@ automation_init(void)
     enabled     = 1;
 
     listen_thread = thread_create_named(automation_thread, NULL, "automation");
-    pclog("Automation: listening on %s%s\n", automation_path, held ? " (held)" : "");
-#endif
+    if (use_tcp)
+        pclog("Automation: listening on tcp:%s:%s (token %.8s..., in %s)%s\n", tcp_host, tcp_port, token,
+              automation_token_file, held ? " (held)" : "");
+    else
+        pclog("Automation: listening on unix:%s%s\n", unix_path, held ? " (held)" : "");
 }
 
 void
 automation_close(void)
 {
-#ifndef _WIN32
     if (!enabled)
         return;
 
     enabled = 0;
-    shutdown(listen_fd, SHUT_RDWR);
-    close(listen_fd);
-    listen_fd = -1;
-    if (client_fd >= 0)
-        shutdown(client_fd, SHUT_RDWR);
+    shutdown(listen_fd, SOCK_SHUT_RW);
+    sock_close(listen_fd);
+    listen_fd = SOCK_INVALID;
+    if (client_fd != SOCK_INVALID)
+        shutdown(client_fd, SOCK_SHUT_RW);
     /* Release a listener that is waiting on the CPU thread. */
     thread_set_event(req_done);
-    unlink(automation_path);
+#ifndef _WIN32
+    if (!use_tcp)
+        unlink(unix_path);
 #endif
+    if (use_tcp)
+        remove(automation_token_file);
 }

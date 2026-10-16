@@ -762,8 +762,11 @@ pc_show_usage(void)
             "Valid options are:\n\n"
             "-? or --help\t\t\t- show this information\n"
 #ifdef USE_AUTOMATION
-            "--automation path\t\t- listen for automation commands on socket 'path'\n"
+            "--automation endpoint\t\t- listen for automation commands: unix:path or\n"
+            "\t\t\t\t   tcp:[host:]port (bare value: a path, or a port on Windows)\n"
             "--automation-hold\t\t- start with the machine held for automation\n"
+            "--automation-token-file path\t- TCP: write the access token to 'path'\n"
+            "--automation-allow-remote\t- TCP: allow a non-loopback listen address\n"
 #endif
             "-A or --assetpath path\t\t- set 'path' to be asset path\n"
 #ifdef SHOW_EXTRA_PARAMS
@@ -943,6 +946,13 @@ usage:
             snprintf(automation_path, sizeof(automation_path), "%s", argv[++c]);
         } else if (!strcasecmp(argv[c], "--automation-hold")) {
             automation_start_held = 1;
+        } else if (!strcasecmp(argv[c], "--automation-token-file")) {
+            if ((c + 1) == argc)
+                goto usage;
+
+            snprintf(automation_token_file, sizeof(automation_token_file), "%s", argv[++c]);
+        } else if (!strcasecmp(argv[c], "--automation-allow-remote")) {
+            automation_allow_remote = 1;
 #endif
         } else if (!strcasecmp(argv[c], "--fullscreen") || !strcasecmp(argv[c], "-F")) {
             start_in_fullscreen = 1;

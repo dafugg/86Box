@@ -3,16 +3,47 @@
 Build with `-D AUTOMATION=ON`, then start 86Box with:
 
 ```
-86Box --automation /path/to/socket [--automation-hold] ...
+86Box --automation <endpoint> [--automation-hold] ...
 ```
 
-86Box listens on that UNIX domain socket and accepts one client at a time.
+86Box listens on the endpoint and accepts one client at a time.
 `--automation-hold` starts the machine **held**: no emulated time passes until
 a client asks for it. That makes runs repeatable and lets a slow client (a
 test harness, a script, an AI agent) take as long as it needs between
 moves.
 
-The socket is not supported on Windows yet.
+## Transports and security
+
+| Endpoint | Transport |
+|---|---|
+| `unix:/path/to/socket` | UNIX domain socket (Linux, macOS) |
+| `tcp:port` | TCP on `127.0.0.1` |
+| `tcp:host:port` | TCP on `host` |
+| bare value | A socket path on Linux/macOS; a TCP port (or `host:port`) on Windows |
+
+Prefer the UNIX socket where you can. It is created owner-only (mode 0600), so
+only your user can connect, and it can't be reached over the network at all.
+
+Any process on the machine can connect to a TCP port, so TCP requires a
+token:
+
+- At startup 86Box generates 32 random bytes from the OS random source and
+  writes them, hex-encoded, to the token file. That's `--automation-token-file
+  <path>`, or `automation.token` in the VM directory by default. On Linux and
+  macOS the file is owner-only; on Windows it inherits the folder's
+  permissions.
+- A client's first line must be `auth <token>`. Anything else, or a wrong
+  token, gets `{"ok":false,"error":"authentication required"}` and the
+  connection is closed. The comparison is constant-time, and the log shows
+  only the first 8 characters of the token. Authentication can't be turned
+  off.
+- 86Box refuses to listen on a non-loopback address unless you also pass
+  `--automation-allow-remote`, and then logs a warning. Think hard before
+  using it. The protocol is unencrypted, and anyone who can reach the port
+  and has the token fully controls the machine, including reading and writing
+  its memory and changing its media.
+
+The token file is deleted when 86Box exits.
 
 ## Protocol (version 1)
 
@@ -56,10 +87,18 @@ VGA latches).
 Try it by hand:
 
 ```
+$ 86Box --automation unix:/tmp/86box.sock --automation-hold &
 $ socat - UNIX-CONNECT:/tmp/86box.sock
 status
 step 1000
 screenshot /tmp/frame.png
+```
+
+Over TCP, send the token first:
+
+```
+$ 86Box --automation tcp:7086 --automation-token-file /tmp/86box.token &
+$ (echo "auth $(cat /tmp/86box.token)"; echo status) | socat - TCP:127.0.0.1:7086
 ```
 
 ## Determinism notes
