@@ -437,31 +437,45 @@ record_frame(void)
     rec_next_ms = emu_ms + rec_interval;
 }
 
+static void
+png_mem_write(png_structp png, png_bytep data, png_size_t len)
+{
+    strbuf_t *sb = png_get_io_ptr(png);
+
+    if ((sb->len + len) > sb->size) {
+        sb->size = (sb->len + len) * 2;
+        sb->buf  = realloc(sb->buf, sb->size);
+    }
+    memcpy(sb->buf + sb->len, data, len);
+    sb->len += len;
+}
+
+static void
+png_mem_flush(UNUSED(png_structp png))
+{
+}
+
+/* Encode the last captured frame as PNG into out. Caller holds frame_mutex. */
 static int
-write_png(const char *fn)
+encode_png(strbuf_t *out)
 {
     png_structp png;
     png_infop   info;
     png_bytep   row;
-    FILE       *fp;
 
     if (!frame_buf || !frame_w || !frame_h)
-        return 0;
-
-    fp = plat_fopen(fn, "wb");
-    if (!fp)
         return 0;
 
     png  = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     info = png ? png_create_info_struct(png) : NULL;
     if (!info || setjmp(png_jmpbuf(png))) {
         png_destroy_write_struct(&png, info ? &info : NULL);
-        fclose(fp);
         return 0;
     }
 
-    png_init_io(png, fp);
-    /* Speed matters more than size for a local socket consumer. */
+    out->len = 0;
+    png_set_write_fn(png, out, png_mem_write, png_mem_flush);
+    /* Speed matters more than size for a socket consumer. */
     png_set_compression_level(png, 1);
     png_set_IHDR(png, info, frame_w, frame_h, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
@@ -481,8 +495,49 @@ write_png(const char *fn)
 
     png_write_end(png, NULL);
     png_destroy_write_struct(&png, &info);
-    fclose(fp);
     return 1;
+}
+
+static strbuf_t png_out;
+
+static int
+write_png(const char *fn)
+{
+    FILE *fp;
+    int   ok;
+
+    if (!encode_png(&png_out))
+        return 0;
+    fp = plat_fopen(fn, "wb");
+    if (!fp)
+        return 0;
+    ok = fwrite(png_out.buf, 1, png_out.len, fp) == png_out.len;
+    fclose(fp);
+    return ok;
+}
+
+static void
+sb_base64(strbuf_t *sb, const uint8_t *data, size_t len)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t            need  = sb->len + ((len + 2) / 3) * 4 + 1;
+
+    if (need > sb->size) {
+        sb->size = need * 2;
+        sb->buf  = realloc(sb->buf, sb->size);
+    }
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = data[i] << 16;
+        if ((i + 1) < len)
+            v |= data[i + 1] << 8;
+        if ((i + 2) < len)
+            v |= data[i + 2];
+        sb->buf[sb->len++] = tbl[(v >> 18) & 63];
+        sb->buf[sb->len++] = tbl[(v >> 12) & 63];
+        sb->buf[sb->len++] = ((i + 1) < len) ? tbl[(v >> 6) & 63] : '=';
+        sb->buf[sb->len++] = ((i + 2) < len) ? tbl[v & 63] : '=';
+    }
+    sb->buf[sb->len] = '\0';
 }
 
 void
@@ -667,14 +722,23 @@ handle_request(char *line)
         mouse_scale(atoi(argv[1]), atoi(argv[2]));
         mouse_set_buttons_ex(atoi(argv[3]));
         respond_ok_time();
-    } else if (!strcmp(argv[0], "screenshot") && (argc >= 2)) {
+    } else if (!strcmp(argv[0], "screenshot")) {
+        /* screenshot <path>: write a PNG file on this machine.
+           screenshot: return the PNG base64-encoded in the reply (works over TCP). */
         int ok;
         thread_wait_mutex(frame_mutex);
-        ok       = write_png(rest[1]);
+        ok       = (argc >= 2) ? write_png(rest[1]) : encode_png(&png_out);
         resp.len = 0;
-        if (ok)
-            sb_printf(&resp, "{\"ok\":true,\"w\":%d,\"h\":%d,\"ms\":%llu,\"frames\":%llu}",
+        if (ok) {
+            sb_printf(&resp, "{\"ok\":true,\"w\":%d,\"h\":%d,\"ms\":%llu,\"frames\":%llu",
                       frame_w, frame_h, (unsigned long long) emu_ms, (unsigned long long) frame_count);
+            if (argc < 2) {
+                sb_printf(&resp, ",\"png\":\"");
+                sb_base64(&resp, (const uint8_t *) png_out.buf, png_out.len);
+                sb_printf(&resp, "\"");
+            }
+            sb_printf(&resp, "}");
+        }
         thread_release_mutex(frame_mutex);
         if (!ok)
             respond_error(frame_buf ? "could not write file" : "no frame rendered yet");
