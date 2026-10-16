@@ -54,6 +54,11 @@
 #define AUTOMATION_PROTOCOL 1
 #define REQ_MAX             4096
 #define MEM_MAX             65536
+#define KEY_QUEUE_MAX       64
+/* Emulated ms between injected key events. One event can be up to six bytes
+   in scan code set 2 (fake shifts around extended keys); delivering many at
+   the same instant overflows the keyboard's 16-byte FIFO and loses keys. */
+#define KEY_GAP_MS          2
 
 #ifdef ENABLE_AUTOMATION_LOG
 int automation_do_log = ENABLE_AUTOMATION_LOG;
@@ -77,7 +82,8 @@ enum {
     CMD_NONE = 0,
     CMD_STEP,
     CMD_WAIT_TEXT,
-    CMD_WAIT_MEM
+    CMD_WAIT_MEM,
+    CMD_KEYS
 };
 
 typedef struct {
@@ -110,6 +116,14 @@ static uint32_t wait_addr;
 static uint8_t  wait_bytes[256];
 static int      wait_len;
 static uint64_t emu_ms;           /* emulated ms executed since startup */
+
+static struct {
+    uint16_t scan;
+    uint8_t  down;
+} key_queue[KEY_QUEUE_MAX];
+static int      key_head;
+static int      key_count;
+static uint64_t key_next_ms;      /* emulated ms at which the next key event is due */
 
 /* Most recent frame handed to the renderer for monitor 0. */
 static mutex_t  *frame_mutex;
@@ -489,17 +503,33 @@ handle_request(char *line)
             return;
         }
     } else if (!strcmp(argv[0], "key") && (argc >= 3)) {
-        /* key down|up <scancode>... ; scancodes in 86Box form, 0x1xx = E0 prefix */
+        /* key down|up <scancode>... ; scancodes in 86Box form, 0x1xx = E0 prefix.
+           Events are delivered KEY_GAP_MS apart; the reply comes once the last
+           one has had its gap, so back-to-back requests cannot flood the FIFO. */
         int down = !strcmp(argv[1], "down");
         if (!down && strcmp(argv[1], "up")) {
             respond_error("expected down or up");
+        } else if ((argc - 2) > KEY_QUEUE_MAX) {
+            respond_error("too many keys in one request");
         } else {
-            for (int i = 2; i < argc; i++)
-                keyboard_input(down, (uint16_t) strtoul(argv[i], NULL, 0));
-            respond_ok_time();
+            key_head  = 0;
+            key_count = 0;
+            for (int i = 2; i < argc; i++) {
+                key_queue[key_count].scan   = (uint16_t) strtoul(argv[i], NULL, 0);
+                key_queue[key_count++].down = down;
+            }
+            begin_timed(CMD_KEYS, UINT64_MAX - emu_ms);
+            keyboard_input(key_queue[0].down, key_queue[0].scan);
+            key_head    = 1;
+            key_next_ms = emu_ms + KEY_GAP_MS;
+            return; /* completed by automation_quantum() */
         }
     } else if (!strcmp(argv[0], "mouse") && (argc == 4)) {
         /* mouse <dx> <dy> <buttons> */
+        /* Mouse devices discard input unless the host has captured the mouse.
+           Set the flag directly: plat_mouse_capture() would grab the host
+           pointer, and is not safe to call from the CPU thread. */
+        mouse_capture = 1;
         mouse_scale(atoi(argv[1]), atoi(argv[2]));
         mouse_set_buttons_ex(atoi(argv[3]));
         respond_ok_time();
@@ -643,7 +673,17 @@ automation_quantum(void)
     if (cmd == CMD_NONE)
         return;
 
-    if ((cmd == CMD_WAIT_TEXT) || (cmd == CMD_WAIT_MEM)) {
+    if (cmd == CMD_KEYS) {
+        if (emu_ms < key_next_ms)
+            return;
+        if (key_head == key_count) {
+            end_timed(-1);
+            return;
+        }
+        keyboard_input(key_queue[key_head].down, key_queue[key_head].scan);
+        key_head++;
+        key_next_ms = emu_ms + KEY_GAP_MS;
+    } else if ((cmd == CMD_WAIT_TEXT) || (cmd == CMD_WAIT_MEM)) {
         if (wait_satisfied())
             end_timed(1);
         else if (emu_ms >= cmd_deadline)

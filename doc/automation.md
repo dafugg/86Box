@@ -33,7 +33,7 @@ startup), `frames` (frames rendered) and `held`.
 | `step <ms>` | Run exactly `ms` of emulated time, then reply. If held, runs without real-time pacing (as fast as the host allows), then holds again. |
 | `wait text <timeout_ms> <text>` | Run until `<text>` (rest of line, matched against raw screen bytes) appears in a single row of the text screen, or until the timeout. Reply has `matched`. |
 | `wait mem <timeout_ms> <addr> <hex>` | Run until physical memory at `addr` equals the hex bytes, or until the timeout. |
-| `key down\|up <scancode>...` | Press or release keys. Scancodes are set-1 make codes; add `0x100` for E0-prefixed keys (e.g. `0x148` = Up). |
+| `key down\|up <scancode>...` | Press or release keys. Scancodes are set-1 make codes; add `0x100` for E0-prefixed keys (e.g. `0x148` = Up). Events are delivered 2 ms of emulated time apart (a burst would overflow the keyboard FIFO); the reply comes after the last event plus its 2 ms, so a request consumes 2 ms per key. |
 | `mouse <dx> <dy> <buttons>` | Relative motion; buttons bitmask 1=left, 2=right, 4=middle. |
 | `screenshot <path>` | Write the most recent frame of monitor 0 as a PNG file. Reply has `w`, `h`. |
 | `text` | Text-mode screen via the BIOS data area: `mode`, `cols`, `rows`, `cursor` [row, col], and `chars`/`attrs` as one hex string per row (CP437). Fails in graphics modes. |
